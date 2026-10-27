@@ -1,0 +1,6 @@
+__pycache__/
+fallback-fonts/
+out/
+*.ttf
+*.otf
+*.cpfont

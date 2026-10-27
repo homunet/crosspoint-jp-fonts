@@ -1,0 +1,150 @@
+--- a/scripts/fontconvert_sdcard.py	2026-10-27 12:53:56
++++ b/scripts/fontconvert_sdcard.py	2026-10-27 12:56:51
+@@ -597,7 +597,8 @@
+ 
+ 
+ def rasterize_font_style(fontfile, size, intervals, style_id=0, force_autohint=False,
+-                         fallback_fontfiles=None, darken_aa=False):
++                         fallback_fontfiles=None, darken_aa=False,
++                         smooth=False, aa_gamma=0.75):
+     """Rasterize all glyphs for one font style. Returns StyleRasterData."""
+     import freetype
+ 
+@@ -628,6 +629,19 @@
+     # than their built-in counterparts at the same nominal weight.
+     aa_thresholds = (3, 6, 10) if darken_aa else (4, 8, 12)
+ 
++    # 8-bit coverage -> 2-bit level lookup table.
++    if smooth:
++        # --smooth: unhinted outlines (no stem snapping to whole pixels, so real
++        # gray edge pixels exist) and a rounded gamma LUT instead of the 4-bit
++        # truncation + thresholds, so faint edge pixels become visible gray.
++        # Never embolden: gamma < 1 only lifts partial-coverage pixels.
++        load_flags |= freetype.FT_LOAD_NO_HINTING
++        aa_lut = bytes(min(3, int(3 * (v / 255.0) ** aa_gamma + 0.5)) for v in range(256))
++    else:
++        # Identical to the original behaviour: (v >> 4) compared to thresholds.
++        aa_lut = bytes(3 if (v >> 4) >= aa_thresholds[2] else 2 if (v >> 4) >= aa_thresholds[1]
++                       else 1 if (v >> 4) >= aa_thresholds[0] else 0 for v in range(256))
++
+     def load_glyph_for_face(target_face, code_point):
+         glyph_index = target_face.get_char_index(code_point)
+         if glyph_index > 0:
+@@ -663,64 +677,26 @@
+ 
+             bitmap = f.glyph.bitmap
+ 
+-            # Build 4-bit greyscale bitmap (same logic as fontconvert.py).
+-            #
+-            # FreeType returns the buffer with bitmap.pitch as the row stride
+-            # in bytes, which can be negative when the bitmap is stored
+-            # bottom-up. Iterating bitmap.buffer linearly assumes
+-            # pitch == width and a top-down layout — that holds in the common
+-            # case but breaks on padded or flipped bitmaps and corrupts the
+-            # output. Walk by (row, col) using the real pitch instead.
+-            #
+-            # Cache bitmap.buffer in a local — ctypes struct field access
+-            # creates a new Python wrapper object each time, so re-evaluating
+-            # it per pixel is catastrophically slow.
+-            pixels4g = []
+-            px = 0
++            # Quantize to 2 bits per pixel, MSB-first, row-major, no row padding;
++            # the final byte is zero-padded. FreeType's bitmap.pitch is the real
++            # row stride and is negative for bottom-up bitmaps, so walk by
++            # (row, col). bitmap.buffer is cached in a local because ctypes
++            # field access creates a new wrapper object on every evaluation.
++            pixels2b = bytearray()
+             buf = bitmap.buffer
+             abs_pitch = abs(bitmap.pitch)
++            acc = 0
++            n = 0
+             for y in range(bitmap.rows):
+                 row_offset = y * abs_pitch if bitmap.pitch >= 0 else (bitmap.rows - 1 - y) * abs_pitch
+                 for x in range(bitmap.width):
+-                    v = buf[row_offset + x]
+-                    if x % 2 == 0:
+-                        px = (v >> 4)
+-                    else:
+-                        px = px | (v & 0xF0)
+-                        pixels4g.append(px)
+-                        px = 0
+-                if bitmap.width % 2 > 0:
+-                    pixels4g.append(px)
+-                    px = 0
+-
+-            # Downsample to 2-bit bitmap
+-            pixels2b = []
+-            px = 0
+-            pitch = (bitmap.width // 2) + (bitmap.width % 2)
+-            for y in range(bitmap.rows):
+-                for x in range(bitmap.width):
+-                    px = px << 2
+-                    bm = pixels4g[y * pitch + (x // 2)]
+-                    bm = (bm >> ((x % 2) * 4)) & 0xF
+-
+-                    if bm >= aa_thresholds[2]:
+-                        px += 3
+-                    elif bm >= aa_thresholds[1]:
+-                        px += 2
+-                    elif bm >= aa_thresholds[0]:
+-                        px += 1
+-
+-                    if (y * bitmap.width + x) % 4 == 3:
+-                        pixels2b.append(px)
+-                        px = 0
+-            if (bitmap.width * bitmap.rows) % 4 != 0:
+-                # Outer parens are for clarity: in Python `*` binds tighter
+-                # than `<<`, so the original `px << (4 - … % 4) * 2` already
+-                # evaluates as `px << ((4 - … % 4) * 2)`. Match the explicit
+-                # bracketing here so the shift width is obvious at a glance,
+-                # mirroring the inner-loop style in fontconvert.py.
+-                px = px << ((4 - (bitmap.width * bitmap.rows) % 4) * 2)
+-                pixels2b.append(px)
++                    acc = (acc << 2) | aa_lut[buf[row_offset + x]]
++                    n += 1
++                    if n % 4 == 0:
++                        pixels2b.append(acc)
++                        acc = 0
++            if n % 4 != 0:
++                pixels2b.append(acc << ((4 - n % 4) * 2))
+ 
+             packed = bytes(pixels2b)
+             advance_x = fp4_from_ft16_16(f.glyph.linearHoriAdvance)
+@@ -879,7 +855,7 @@
+ 
+ def generate_cpfont_multistyle(style_fonts, size, intervals, output_path,
+                                force_autohint=False, fallback_style_fonts=None,
+-                               darken_aa=False):
++                               darken_aa=False, smooth=False, aa_gamma=0.75):
+     """Generate a multi-style v4 .cpfont file.
+ 
+     style_fonts: dict of {style_id: fontfile_path} e.g. {0: "Regular.ttf", 2: "Italic.ttf"}
+@@ -903,7 +879,7 @@
+         raster_data[style_id] = rasterize_font_style(
+             fontfile, size, intervals, style_id=style_id,
+             force_autohint=force_autohint, fallback_fontfiles=fallback_fontfiles or None,
+-            darken_aa=darken_aa)
++            darken_aa=darken_aa, smooth=smooth, aa_gamma=aa_gamma)
+ 
+     # Pack binary sections for each style
+     packed_sections = {}  # style_id -> tuple of section bytearrays
+@@ -998,6 +974,10 @@
+                         help="Font family name for output filenames (default: derived from font filename).")
+     parser.add_argument("--force-autohint", dest="force_autohint", action="store_true",
+                         help="Force FreeType auto-hinter instead of native font hinting.")
++    parser.add_argument("--smooth", dest="smooth", action="store_true",
++                        help="Unhinted rendering + gamma LUT for smoother 2-bit anti-aliasing (no emboldening).")
++    parser.add_argument("--aa-gamma", dest="aa_gamma", type=float, default=0.75,
++                        help="Gamma for --smooth (default 0.75). Lower = darker/heavier edges, 1.0 = linear.")
+     parser.add_argument("--darken-aa", dest="darken_aa", action="store_true",
+                         help="Use darker 2-bit anti-aliasing thresholds, matching the built-in "
+                              "reading fonts (Bitter/Lexend Deca/ChareInk).")
+@@ -1133,7 +1113,7 @@
+             style_fonts, sz, intervals, output_path,
+             force_autohint=args.force_autohint,
+             fallback_style_fonts=fallback_style_fonts or None,
+-            darken_aa=args.darken_aa)
++            darken_aa=args.darken_aa, smooth=args.smooth, aa_gamma=args.aa_gamma)
+     print(f"\nTotal: {len(sizes)} files, {total_size / 1024 / 1024:.2f} MB", file=sys.stderr)
+ 
+ 
